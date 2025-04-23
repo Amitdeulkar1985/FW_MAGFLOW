@@ -28,9 +28,9 @@
 
 //#define DELAY_uS  1000000       // 10 sec timer
 
-#define  INPUT_PIN_2         18        // By default high Default frequency set
+//#define  INPUT_PIN_2         18        // By default high Default frequency set
 #define  INPUT_PIN_1         42 
-#define  INPUT_PIN_3         17        // to detect 37hz  // added on 11_02_2023
+//#define  INPUT_PIN_3         17        // to detect 37hz  // added on 11_02_2023
 
 #define PIN1                  5 //1             // GPIO pin 1         //Excitation PINS 
 #define PIN2                  6 //2             // GPIO pin 2
@@ -41,18 +41,18 @@
 
 #define PWM_1               7            //46  Frequency Generation with 50% duty
 
-#define EMPTY_PIN       3
+#define EMPTY_PIN           3
 
 //Pins for Calibartion
-#define Calibration_Mode  9
-#define ADD1              10
-#define ADD2              11
-#define ADD3              12
-#define ADD4              13
+#define Calibration_Mode  10    //SJ2
+#define ADD1              9     //SJ6
+#define ADD2              11    //SJ5
+#define ADD3              12    //SJ4
+#define ADD4              13    //SJ3
 
-#define CAL_TX_PIN        10  // TX on Pin 10
-#define CAL_RX_PIN        11  // RX on Pin 11
-#define RS_485_RX_TX      8
+#define CAL_TX_PIN        17  // TX on Pin 10
+#define CAL_RX_PIN        18  // RX on Pin 11
+#define RS_485_RX_TX      21
 
 #define GREEN_LED         38
 #define RED_LED           39
@@ -62,12 +62,12 @@ HardwareSerial MySerial(1);  // Use UART1
 //-----------------------
 
 #define Toggle_For_Coil_2   8              // only for testing
-#define Toggle_For_Coil_1   45              // only for testing
+#define Toggle_For_Coil_1   45             // only for testing
 
 #define BAUDRATE            9600          //  baudrate set
 #define DEBUG_EN            1             // debug ADC
 
-#define EEPROM_SIZE     150
+#define EEPROM_SIZE     250
 #define EEPROM_ADDR     10
 #define SERIAL_NO_ADD   75
 #define PCB_NO_ADD      100
@@ -309,8 +309,8 @@ void setup()
     #endif
 
     MySerial.begin(9600, SERIAL_8N1, CAL_RX_PIN, CAL_TX_PIN);
-    pinMode(CAL_RX_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(CAL_RX_PIN), caluartISR, FALLING);
+    //pinMode(CAL_RX_PIN, INPUT);
+    //attachInterrupt(digitalPinToInterrupt(CAL_RX_PIN), caluartISR, FALLING);
     digitalWrite(RS_485_RX_TX,0);
     
     //--------------------------------
@@ -356,6 +356,7 @@ void loop()
 {
     //unsigned int Var_4=0;
     
+               //digitalWrite(RS_485_RX_TX,1);
   //******************************** Timer 1 checking *****************************************
             if(f1)  // if flag is set then go inside
               {
@@ -376,11 +377,13 @@ void loop()
                       Check_Recived_String();   
               }
 
-              if(Rx_Cal_Int_Flag)
+              /*if(Rx_Cal_Int_Flag)
               {
                     Rx_Cal_Int_Flag = 0;
+                    
+                    
                     Check_Cal_Recived_String();
-              }
+              }*/
 
               //Calibration data 
               if(Compare_data)
@@ -454,14 +457,20 @@ void loop()
 
         if(Check_Empty_Flow)
         {
+             // digitalWrite(PIN2, 0); 
+              //digitalWrite(PIN1, 0); 
+              //f1 = 0;
               Check_Empty_Flow = 0;
               Serial.println("Checking Empty Pipe\n");
               //timerAlarmDisable(Freq_timer);
               //timerAlarmDisable(My_timer); //Just Enable 
+              //timerAlarmDisable(timer1);
 
+              delay(10);
               for (int i = 0; i < 3; i++) 
               {
                   digitalWrite(EMPTY_PIN, HIGH);
+                  //Empty_Adc[i] = analogRead(FLOW_ADC_Pin);
                   delay(1);
                   digitalWrite(EMPTY_PIN, LOW);
                   Empty_Adc[i] = analogRead(FLOW_ADC_Pin);
@@ -502,7 +511,7 @@ void loop()
                     Empty_Tube_Error = 0;
                     Serial.print("Empty Pipe fault reset");
               }
-
+                //timerAlarmEnable(timer1);
               //timerAlarmEnable(Freq_timer);
               //timerAlarmEnable(My_timer); //Just Enable 
         }
@@ -605,6 +614,8 @@ void loop()
         {
               Start_calibration = 1;
               Opeation_state = Cal_Conf_Mode;
+              //Serial.println("Calibration on \n");
+               Read_485_Address();
         }
         else if(Empty_Tube_Error)
         {
@@ -614,8 +625,22 @@ void loop()
         {
               Opeation_state = Low_Flow;
         }
+        else
+        {
+              Opeation_state = Normal_Flow;
+        }
 
         Led_Operation();
+
+        //digitalWrite(RS_485_RX_TX,1);
+        //Send_Calibration();
+        //digitalWrite(RS_485_RX_TX,0);
+
+        if (MySerial.available())   //RS485 SERIAL PORT
+        {
+              Check_Cal_Recived_String();
+        }
+                
 //Recieve_UART();
 }
 //***************************************************** ISR_Routines*********************************************************
@@ -984,14 +1009,18 @@ void Check_Recived_String(void)
 }
 void Check_Cal_Recived_String(void)
 {
-       while(Serial1.available()>0)
+      // Serial.print("above while\n");
+       while(MySerial.available()>0)
       {
-              cal_receive_byte=Serial1.read();
+              cal_receive_byte=MySerial.read();
               //if(receive_byte=='#' && Rx_Ch==0)
+
+                 //Serial.print("in side interrupt loop\n");
 
                   if(cal_receive_byte == '*')
                   {
                         Save_data = 1;
+                        CAL_DATA_COUNTER = 0;
                   }
                   else if(cal_receive_byte == '#')
                   {
@@ -1069,9 +1098,9 @@ void GPIO_Setup()
     pinMode(PIN1, OUTPUT);              //  Make pin as output
     pinMode(PIN2, OUTPUT);              //  Make pin as output
   
-    pinMode(INPUT_PIN_2,INPUT);                         // make pin as input 
+    //pinMode(INPUT_PIN_2,INPUT);                         // make pin as input 
     pinMode(INPUT_PIN_1,INPUT_PULLUP);                  // make pin as input pullup
-    pinMode(INPUT_PIN_3,INPUT_PULLUP);                  // make pin as input pullup
+    //pinMode(INPUT_PIN_3,INPUT_PULLUP);                  // make pin as input pullup
 //*****************************  ADC Channel Pins******************************
     pinMode(ADC_Pin,INPUT);                         // make pin as input 
     pinMode(ADC_Pin,INPUT_PULLDOWN);                // make pin as input pullup
@@ -1231,7 +1260,7 @@ void printIntArray(unsigned int* arr, int size)
  {
         float retrievedFloatValue;
         unsigned char floatBytes3[5];
-        EEPROM.begin(150);                                              // Initialize EEPROM
+        EEPROM.begin(250);                                              // Initialize EEPROM
         for (int i = 0; i < EEPROM_SIZE; i++)           //24_02_24
         {
           EEPROM_Save[i] = EEPROM.read(EEPROM_ADDR + i);
@@ -1549,7 +1578,7 @@ void printIntArray(unsigned int* arr, int size)
           else
           {
              // Pipe_Size = 2;
-              //Serial.println("Reading from memory");
+              Serial.println("Reading from memory");
               Calibration_Points = EEPROM_Save[25];     //no of calibration points
 
               Calibration_P1_start =  (EEPROM_Save[27] << 8) |EEPROM_Save[26];    //cal1 start point
@@ -3085,6 +3114,9 @@ void Read_485_Address(void)
             RS_485_addr = 10;
      }
     // RS_485_addr = 1;
+
+   // Serial.print("RS_485_addr = ");
+    //Serial.println(RS_485_addr);
 }
 
 void Calibration_Process(void)
@@ -3095,15 +3127,20 @@ void Calibration_Process(void)
 
           if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'F')
           {
+                  Serial.println("\nreading configuration \n");
                   Read_Configuration();
           }
           if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'S')
           {
                 Calibration_on = 1;
                 Calibration_counter = 0;
+
+                Serial.println("\nCalibration start \n");
           }
           else if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'E')
           {
+                  Serial.println("\nCalibration stop \n");
+
                   Calibration_on = 0;
 
                   Store_calb_data();
@@ -3111,6 +3148,8 @@ void Calibration_Process(void)
           else if(Cal_Rcvd_Data[1] == 'F')
           {
                 
+                Serial.println("\n received calibration value \n");
+
                 val1 = Cal_Rcvd_Data[2] - 0x30; 
                 val2 = Cal_Rcvd_Data[3] - 0x30;
                 Calibration_counter = (val1 * 10) + val2;
@@ -3141,6 +3180,8 @@ void Calibration_Process(void)
           }
           else if(Cal_Rcvd_Data[1] == 'R' && Cal_Rcvd_Data[2] == 'F')
           {
+                Serial.println("\nsending flow \n");
+
                 val1 = Cal_Rcvd_Data[3] - 0x30; 
                 val2 = Cal_Rcvd_Data[4] - 0x30;
 
@@ -3153,22 +3194,10 @@ void Calibration_Process(void)
                       digitalWrite(RS_485_RX_TX,0);
                 }
           }
-          else if(Cal_Rcvd_Data[1] == 'R' && Cal_Rcvd_Data[2] == 'C' && Cal_Rcvd_Data[3] == 'F')
-          {
-                val1 = Cal_Rcvd_Data[3] - 0x30; 
-                val2 = Cal_Rcvd_Data[4] - 0x30;
 
-                final_val = (val1 * 10) + val2;
-
-                if(final_val == RS_485_addr)
-                {
-                      digitalWrite(RS_485_RX_TX,1);
-                      Send_Configuration();
-                      digitalWrite(RS_485_RX_TX,0);
-                }
-          }
           else if(Cal_Rcvd_Data[1] == 'G' && Cal_Rcvd_Data[2] == 'E' && Cal_Rcvd_Data[3] == 'T' && Cal_Rcvd_Data[4] == 'C')
           {
+                Serial.println("\n sending configuration \n");
                 val1 = Cal_Rcvd_Data[3] - 0x30; 
                 val2 = Cal_Rcvd_Data[4] - 0x30;
 
@@ -3183,6 +3212,7 @@ void Calibration_Process(void)
           }
           else if(Cal_Rcvd_Data[1] == 'S' && Cal_Rcvd_Data[2] == 'R') //DEVICE SERIAL NO
           {
+                Serial.println("\nsetting device serial no \n");
                 val1 = Cal_Rcvd_Data[3] - 0x30; 
                 val2 = Cal_Rcvd_Data[4] - 0x30;
 
@@ -3210,6 +3240,8 @@ void Calibration_Process(void)
           }
           else if(Cal_Rcvd_Data[1] == 'P' && Cal_Rcvd_Data[2] == 'S' && Cal_Rcvd_Data[3] == 'R')  //PCB SERIAL NO
           {
+                Serial.println("\nsetting pcb serial no \n");
+
                 val1 = Cal_Rcvd_Data[3] - 0x30; 
                 val2 = Cal_Rcvd_Data[4] - 0x30;
 
@@ -3237,6 +3269,8 @@ void Calibration_Process(void)
           }
           else if(Cal_Rcvd_Data[1] == 'T' && Cal_Rcvd_Data[2] == 'S' && Cal_Rcvd_Data[3] == 'R')  //FLOW TUBE SERIAL NO
           {
+                Serial.println("\nsetting flow tube serial no \n"); 
+
                 val1 = Cal_Rcvd_Data[3] - 0x30; 
                 val2 = Cal_Rcvd_Data[4] - 0x30;
 
@@ -3264,6 +3298,7 @@ void Calibration_Process(void)
           }
           else if(Cal_Rcvd_Data[1] == 'T')
           {
+                Serial.println("\ntesting communication \n");
                 val1 = Cal_Rcvd_Data[2] - 0x30; 
                 val2 = Cal_Rcvd_Data[3] - 0x30;
 
