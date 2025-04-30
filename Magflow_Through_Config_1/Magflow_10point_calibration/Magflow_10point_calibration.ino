@@ -4,6 +4,13 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include <EEPROM.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <WebServer.h> 
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Update.h>
 
 #define ADC_Pin        1                 //ADC input channel     // later it should be 1
 
@@ -57,7 +64,37 @@
 #define GREEN_LED         38
 #define RED_LED           39
 
+#define REED_SWITCH        37
+
 HardwareSerial MySerial(1);  // Use UART1
+
+//------------------BLUETOOTH CONFIGURATION-------------------------
+BLECharacteristic *pCharacteristic;
+BLEServer* pServer;
+bool deviceConnected = false;
+unsigned long connectionStartTime = 0; 
+static bool disconnectedManually = false;
+
+#define SERVICE_UUID        "12345678-1234-5678-1234-56789abcdef0"
+#define CHARACTERISTIC_UUID "abcd1234-5678-90ab-cdef-1234567890ab"
+
+//-----------------------WIFI DETAILS----------------
+const char* ssid = "";          // Wi-Fi SSID
+const char* password = "";     // Wi-Fi password
+
+const char* ssid1 = "MAGFLOW_Config_AP";
+const char* password1 = "12345678";
+
+String apiKey = "k5GS7O2nA7Hop0x";
+String apiSecret = "3bVNEbHmtRnHuOa";
+String auth = apiKey + ":" + apiSecret;
+
+int authLen = auth.length();
+//char encodedAuth[base64_enc_len(authLen)];
+//base64_encode(encodedAuth, (char*)auth.c_str(), authLen);
+//web server
+// Create a web server on port 80
+WebServer server(80);
 
 //-----------------------
 
@@ -67,11 +104,14 @@ HardwareSerial MySerial(1);  // Use UART1
 #define BAUDRATE            9600          //  baudrate set
 #define DEBUG_EN            1             // debug ADC
 
-#define EEPROM_SIZE     250
+#define EEPROM_SIZE     512
 #define EEPROM_ADDR     10
 #define SERIAL_NO_ADD   75
 #define PCB_NO_ADD      100
 #define FLOW_TUBE_ADD   125
+
+#define SSID_ADDR       200             // starting byte for SSID
+#define PASS_ADDR       300
 
 #define BUF_SIZE 100
 
@@ -133,6 +173,7 @@ void IRAM_ATTR Recieve_UART();
 volatile bool Rx_Int_Flag=0;
 volatile bool Rx_Cal_Int_Flag = 0;
 volatile char Rx_String_Complete=0;
+unsigned char Pin_Counter;
 void Convert_For_LCD(uint16_t ADC_Value);
 uint8_t V1,V2,V3,V4;
 uint8_t BCD_4(uint16_t int_16,uint16_t div_16);
@@ -145,6 +186,7 @@ void Led_Operation(void);
 //***********************************************************************************************************************
 bool Start_ADC_Sampling_Delay=0;
 bool ADC_Read_Start=0;
+bool Server_Connected;
 unsigned int Recieve_ADC_Read_Delay=0;
 
 unsigned int ADC_Read_Delay=0;
@@ -188,9 +230,9 @@ unsigned int READ_FLOW;
 
 unsigned int Calibration_flow[11];
 unsigned int Calibration_adc[11];
-unsigned char Device_Serial_no[25];
-unsigned char Pcb_Serial_no[25];
-unsigned char Flowtube_Serial_no[25];
+unsigned char Device_Serial_no[25] = "111111";
+unsigned char Pcb_Serial_no[25] = "111111";;
+unsigned char Flowtube_Serial_no[25] = "111111";;
 
 bool Start_calibration;
 bool End_calibration;
@@ -256,6 +298,7 @@ void PWM_Init();
 void PWM_Set();
 //*************************************************************************************************************************
 unsigned char EEPROM_Save[EEPROM_SIZE]="#0000000000@";  
+String chipId;
 void printIntArray(unsigned int* arr, int size) ;
 void Recall_Memory();
 void Pipe_Size_Selection();
@@ -301,6 +344,410 @@ volatile bool Compare_data;
 bool Empty_Tube_Error;
 
 //**************************************************************************************************************************
+//------------------------------WIFI FUNCTION--------------------------
+// HTML content from files
+const char* wifiPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wi-Fi Configuration</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #006622;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      color: #fff;
+    }
+    h2 { text-align: center; color: #fff; }
+    form {
+      width: 100%;
+      max-width: 400px;
+      background: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    }
+    label {
+      font-weight: bold;
+      display: inline-block;
+      color: #333;
+    }
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 15px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    input[type="submit"] {
+      background-color: #006622;
+      color: white;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div>
+    <h2>Wi-Fi Credentials</h2>
+    <form action="/submit" method="POST">
+      <label for="wifi_ssid">Wi-Fi SSID:</label>
+      <input type="text" id="wifi_ssid" name="wifi_ssid" required>
+      <label for="wifi_password">Wi-Fi Password:</label>
+      <input type="password" id="wifi_password" name="wifi_password" required>
+      <input type="submit" value="Submit">
+    </form>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+const char* successPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wi-Fi Configuration</title>
+  <style>
+    /* General reset and styling */
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #006622; /* Set to green */
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      color: #fff; /* Set text color to white for contrast */
+    }
+
+    h2 {
+      text-align: center;
+      color: #fff; /* Keep header text white */
+    }
+
+    form {
+      width: 100%;
+      max-width: 400px;
+      background: #fff; /* White form background for contrast */
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+      text-align: left;
+    }
+
+    label {
+      font-weight: bold;
+      margin-bottom: 5px;
+      display: inline-block;
+      color: #333; /* Dark label text for readability */
+    }
+
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 15px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+
+    input[type="submit"] {
+      width: 100%;
+      padding: 10px;
+      background-color: #006622; /* Match background color */
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background-color 0.3s ease, transform 0.2s ease;
+    }
+
+    input[type="submit"]:hover {
+      background-color: #004d1a; /* Darker green on hover */
+      transform: scale(1.05); /* Slight zoom effect */
+    }
+
+    @media (max-width: 480px) {
+      form {
+        padding: 15px;
+      }
+
+      input[type="text"],
+      input[type="password"],
+      input[type="submit"] {
+        font-size: 14px;
+        padding: 8px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div>
+    <form action="/submit" method="POST">
+      <label for="wifi_ssid">
+        <h2></h2>
+        <p>Wi-Fi Configuration Received...! 😊</p>
+      </label>
+    </form>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+const char* failedPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wi-Fi Configuration</title>
+  <style>
+    /* General reset and styling */
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #006622; /* Set to green */
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      color: #fff; /* Set text color to white for contrast */
+    }
+
+    h2 {
+      text-align: center;
+      color: #fff; /* Keep header text white */
+    }
+
+    .error-message {
+      color: red;
+      font-weight: bold;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+
+    form {
+      width: 100%;
+      max-width: 400px;
+      background: #fff; /* White form background for contrast */
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+      text-align: left;
+    }
+
+    label {
+      font-weight: bold;
+      margin-bottom: 5px;
+      display: inline-block;
+      color: #333; /* Dark label text for readability */
+    }
+
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 15px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+
+    input[type="submit"] {
+      width: 100%;
+      padding: 10px;
+      background-color: #006622; /* Match background color */
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background-color 0.3s ease, transform 0.2s ease;
+    }
+
+    input[type="submit"]:hover {
+      background-color: #004d1a; /* Darker green on hover */
+      transform: scale(1.05); /* Slight zoom effect */
+    }
+
+    @media (max-width: 480px) {
+      form {
+        padding: 15px;
+      }
+
+      input[type="text"],
+      input[type="password"],
+      input[type="submit"] {
+        font-size: 14px;
+        padding: 8px;
+      }
+    }
+  </style>
+</head>
+
+
+<body>
+  <div>
+    <form action="/submit" method="POST">
+      <label for="wifi_ssid">
+        <h2></h2>
+        <p> Wi-Fi Configuration Failed...! 😢</p>
+      </label>
+    </form>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// Function to handle the root URL
+void handleRoot() {
+  server.send(200, "text/html", wifiPage);
+}
+
+// Function to handle form submission
+void handleSubmit() {
+  if (server.method() == HTTP_POST) {
+    String wifi_ssid = server.arg("wifi_ssid");
+    String wifi_password = server.arg("wifi_password");
+
+    // Validate inputs
+    if (wifi_ssid.isEmpty() || wifi_password.isEmpty()) {
+      server.send(400, "text/html", failedPage);
+      return;
+    }
+
+    // Print received parameters to Serial Monitor
+    Serial.println("Configuration Received:");
+    Serial.println("Wi-Fi SSID: " + wifi_ssid);
+    Serial.println("Wi-Fi Password: " + wifi_password);
+
+    // Send confirmation response to the client
+    server.send(200, "text/html", successPage);
+
+    EEPROM.begin(EEPROM_SIZE);
+    writeStringToEEPROM(SSID_ADDR, wifi_ssid);
+    writeStringToEEPROM(PASS_ADDR, wifi_password);
+    EEPROM.commit(); // IMPORTANT!
+
+
+  } else 
+  {
+    server.send(405, "text/html", failedPage);
+  }
+
+
+  delay(5000);
+  WiFi.softAPdisconnect(true);  // Stop AP
+  WiFi.mode(WIFI_STA);          // Set mode to Station (normal WiFi client)
+  //WiFi.begin(ssid, password); 
+
+  String s = readStringFromEEPROM(SSID_ADDR);
+  ssid = s.c_str();
+  
+  String p = readStringFromEEPROM(PASS_ADDR);
+  password = p.c_str();
+
+   connectWiFi();
+   int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 20) 
+    {
+      delay(500);
+      Serial.print(".");
+      retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) 
+    {
+      Serial.println("\nConnected!");
+      Serial.println(WiFi.localIP());
+
+      // Step 1: Retrieve API credentials (api_key and api_secret) from the device details API.
+        String api_key, api_secret;
+        if (!getDeviceDetails(chipId, api_key, api_secret)) 
+        {
+          Serial.println("[ERROR] Failed to obtain device details. Aborting.");
+          return;
+        }
+
+        // Step 2: Retrieve the firmware download URL using the API credentials.
+        String firmware_url;
+        if (!getFirmwareUrl(chipId, api_key, api_secret, firmware_url)) 
+        {
+          Serial.println("[ERROR] Failed to obtain firmware URL. Aborting.");
+          return;
+        }
+
+        Serial.println("Firmware URL: " + firmware_url);
+        delay(10000); // Optional delay for debugging or observation.
+
+        // Step 3: Download and update firmware via OTA using the obtained firmware URL.
+        performOTAUpdate(firmware_url, chipId, api_key, api_secret);
+    } 
+    else 
+    {
+      Serial.println("\nFailed to connect.");
+    }
+  if (WiFi.status() != WL_CONNECTED) 
+  {
+    Serial.println("[ERROR] Wi-Fi connection failed. Aborting.");
+    return;
+  }
+
+  Pin_Counter = 0;
+  Server_Connected = 0;
+
+}
+
+//***************************************************************************
+// Function: connectWiFi()
+// Purpose:  Establish a Wi-Fi connection using the specified SSID and password.
+//***************************************************************************
+void connectWiFi() {
+  Serial.print("[BOOT] Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+  int retries = 0;
+  
+  // Wait for Wi-Fi connection with a maximum of 20 retries.
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  
+  // Check if Wi-Fi is connected, else log an error.
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[BOOT] Wi-Fi Connected!");
+  } else {
+    Serial.println("\n[ERROR] Failed to connect to Wi-Fi.");
+  }
+}
+
+//-----------------BLE FUNCTIONS
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    disconnectedManually = false;
+    connectionStartTime = millis();
+    Serial.println("Client connected");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("Client disconnected");
+  }
+};;
 
 void setup()
 {  
@@ -348,6 +795,48 @@ void setup()
     //digitalWrite(MUX_A, 0);
    //digitalWrite(MUX_B, 0);
     //digitalWrite(MUX_C, 0);
+
+    //----------BLE INIT--------------
+
+    String bleName = "VMAG-" + String((char*)Device_Serial_no);
+
+    //BLEDevice::init("VATS MAGFLOW");
+     BLEDevice::init(bleName.c_str());
+
+    pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+
+  pCharacteristic->setValue("Flow Rate: 0 lph");
+  pService->start();
+
+  // Start Advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->start();
+
+  Serial.println("Waiting for a client connection to notify...");
+
+   /*uint64_t chipIdVal = ESP.getEfuseMac();
+  uint32_t highPart = (uint32_t)(chipIdVal >> 32);
+  uint32_t lowPart = (uint32_t)chipIdVal;
+  char chipIdBuffer[24];
+  // Format the chip ID as "AVY_BC_<highPart><lowPart>".
+  snprintf(chipIdBuffer, sizeof(chipIdBuffer), "AVY_BC_%08X%08X", highPart, lowPart);
+  chipId = String(chipIdBuffer);
+
+  Serial.print("Custom Chip ID: ");
+  Serial.println(chipId);*/
+  chipId = "1224-045-00001";
+ 
 
 
 }
@@ -470,10 +959,10 @@ void loop()
               for (int i = 0; i < 3; i++) 
               {
                   digitalWrite(EMPTY_PIN, HIGH);
-                  //Empty_Adc[i] = analogRead(FLOW_ADC_Pin);
+                  Empty_Adc[i] = analogRead(FLOW_ADC_Pin);
                   delay(1);
                   digitalWrite(EMPTY_PIN, LOW);
-                  Empty_Adc[i] = analogRead(FLOW_ADC_Pin);
+                  //Empty_Adc[i] = analogRead(FLOW_ADC_Pin);
                   delay(1);
               }
               int adcValue = (Empty_Adc[0] + Empty_Adc[1] + Empty_Adc[2]) / 3;
@@ -640,10 +1129,67 @@ void loop()
         {
               Check_Cal_Recived_String();
         }
-                
-//Recieve_UART();
+
+        //IF CONNECTED SEND DATA
+        if (deviceConnected && !disconnectedManually) 
+        {
+            // Send flow rate
+            String data = "Flow Rate: " + String(Flow_Rate) + " lph";
+            pCharacteristic->setValue(data.c_str());
+            pCharacteristic->notify();
+            Serial.println("Sent: " + data);
+
+            // Check if 1 minute has passed
+            if (millis() - connectionStartTime > 10000) 
+            {
+              Serial.println("Auto disconnecting client after 10 seconds...");
+              if (pServer != nullptr) 
+              {
+                pServer->disconnect(0);  // Use pServer instead of BLEDevice::getServer()
+                disconnectedManually = true;  // prevent repeat
+
+                // Restart advertising after disconnection
+                BLEDevice::getAdvertising()->start();
+                Serial.println("Advertising restarted...");
+                connectionStartTime = 0;
+              }
+            }
+  }
+
+    int pinState = digitalRead(REED_SWITCH);
+
+     if(pinState == LOW)
+     {
+          delay(500);
+          Pin_Counter++;
+     }
+     else
+     {
+          Pin_Counter = 0;
+     }
+
+     if(Pin_Counter >= 4 && !Server_Connected)
+     {
+          Serial.println("Starting Webserver");
+          Pin_Counter = 0;
+          Server_Connected = 1;
+          Web_server();
+     }
+     if(Server_Connected)
+     {
+        server.handleClient();
+     }
+             
 }
 //***************************************************** ISR_Routines*********************************************************
+
+/**************************************************************************************
+**  Function Prototype: void ADC_Sampling_Check(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to make flags for adc calulation
+***************************************************************************************/
 void ADC_Sampling_Check(void)
 {
       unsigned int Var_4=0;
@@ -676,10 +1222,10 @@ void ADC_Sampling_Check(void)
                         //  Serial.print("Cnt2Sample");
                         // Serial.print(ADC_Count_2);
 
-                        if(ADC_Count_2 > 4095)
-                        {
-                                ADC_Count_2=4095;
-                        }
+                        //if(ADC_Count_2 > 4095)
+                       // {
+                               // ADC_Count_2=4095;
+                        //}
                         ADC_Count_2_Buff[Var_2]=ADC_Count_2;
                         Var_2++;
                         if(Var_2 >= ADC_Avg_Num)     // added 19_02_24
@@ -699,10 +1245,10 @@ void ADC_Sampling_Check(void)
                       N_Sample_Counter_Flag=0;
                       N_Sample_Counter=0; 
                       ADC_Count_1=ADC_Count_1/N_Samples_Set;
-                      if(ADC_Count_1>4095)
-                      {
-                            ADC_Count_1=4095;
-                      }
+                      //if(ADC_Count_1>4095)
+                      //{
+                            //ADC_Count_1=4095;
+                      //}
                       ADC_Count_1_Buff[Var_1]=ADC_Count_1;
                       Var_1++;
                      // if(Var_1>=ADC_Avg_Num)     // removed 19_02_24  
@@ -788,7 +1334,15 @@ void ADC_Sampling_Check(void)
             ADC_Read_Stop=1;  
       }  
 }
-void Calculate_Delta()
+
+/**************************************************************************************
+**  Function Prototype: void Calculate_Delta(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to calculate delata from two coil adc readings
+***************************************************************************************/
+void Calculate_Delta(void)
 {
           //Delta=((ADC_Count_1)-(ADC_Count_2));
            Delta=((ADC_Avg_1)-(ADC_Avg_2));
@@ -814,14 +1368,30 @@ void Calculate_Delta()
           // M4[18]='@';
  
 }
-void PWM_Init()
+
+/**************************************************************
+**  Function Prototype: void PWM_Init(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to initialise pwm 
+****************************************************************/
+void PWM_Init(void)
 {
   ledcSetup(ledChannel, PWM_Freq, resolution);        //resolution is 13 bit 
 
   ledcAttachPin(PWM_1, ledChannel);                   // attach the channel to the GPIO to be controlled
   ledcWrite(0, 4095);                                 //PWM Duty 50%   2^13−1=8191, for 50% 8191 / 2 = 4095.5
 }
-void PWM_Set()
+
+/**************************************************************
+**  Function Prototype: void PWM_Set(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to set pwm frequency
+****************************************************************/
+void PWM_Set(void)
 { 
      //Delta= 25000;
 
@@ -920,28 +1490,67 @@ void PWM_Set()
      }
 }
 //************************************************************************************************
-void IRAM_ATTR Timer0_Interrupt()  
+
+/**************************************************************
+**  Function Prototype: void IRAM_ATTR Coil_2(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Isr routine for coil -2 input
+****************************************************************/
+void IRAM_ATTR Timer0_Interrupt(void)  
 {
   Timer0_Int_flag  = 1;      // set flag in interrupt 
    
 }
-void IRAM_ATTR Recieve_UART()
+
+/**************************************************************
+**  Function Prototype: void IRAM_ATTR Coil_2(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Isr routine for coil -2 input
+****************************************************************/
+void IRAM_ATTR Recieve_UART(void)
 {
       Rx_Int_Flag=1;
       
 }
 
-void IRAM_ATTR Coil_2()  
+/****************************************************************************************************
+**  Function Prototype: void IRAM_ATTR Coil_2(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Isr routine for coil -2 input
+*****************************************************************************************************/
+void IRAM_ATTR Coil_2(void)  
 {
   Coil_2_flag = 1;      // set flag in interrupt 
 
    
 }
-void IRAM_ATTR Coil_1()  
+
+/****************************************************************************************************
+**  Function Prototype: void IRAM_ATTR Coil_1(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Isr routine for coil -1 input
+*****************************************************************************************************/
+void IRAM_ATTR Coil_1(void)  
 {
   Coil_1_flag = 1;      // set flag in interrupt 
 
 }
+
+/****************************************************************************************************
+**  Function Prototype: void Check_Cal_Recived_String(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read decode commands received on serial port 0
+*****************************************************************************************************/
 void Check_Recived_String(void)
 {
        while(Serial.available()>0)
@@ -1007,6 +1616,14 @@ void Check_Recived_String(void)
         //}
    }
 }
+
+/****************************************************************************************************
+**  Function Prototype: void Check_Cal_Recived_String(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read decode commands received on serial port 0
+*****************************************************************************************************/
 void Check_Cal_Recived_String(void)
 {
       // Serial.print("above while\n");
@@ -1027,6 +1644,8 @@ void Check_Cal_Recived_String(void)
                         Save_data = 0;
                         Compare_data = 1;
                         Cal_Rcvd_Data[CAL_DATA_COUNTER] = cal_receive_byte;
+                        CAL_DATA_COUNTER++;
+                        Cal_Rcvd_Data[CAL_DATA_COUNTER] = '#';
                         //GSM_COUNTER++;
                   }
                   if(Save_data == 1)
@@ -1042,7 +1661,7 @@ void Check_Cal_Recived_String(void)
         //}
    }
 }
- uint16_t ADC_Average()
+ /*uint16_t ADC_Average()
 {
     uint8_t  avg=0;
     uint16_t vio=0;
@@ -1061,6 +1680,27 @@ void Check_Cal_Recived_String(void)
       // Serial.println("Actual ADC is");   // only for testing purpose
       // Serial.print(vio);
     return vio;
+}*/
+
+ /****************************************************************************************************
+**  Function Prototype: uint16_t ADC_Average(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: adc avarge value
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read adc readings and return average value
+*****************************************************************************************************/
+uint16_t ADC_Average(void) 
+{
+    const uint8_t samples = 20;
+    const uint8_t avg_no = samples / 2;
+    uint32_t total = 0;
+
+    for (uint8_t i = 0; i < samples; i++) 
+    {
+        total += analogRead(ADC_Pin);
+    }
+
+    return total / avg_no;
 }
 
 uint8_t BCD_4(uint16_t int_16,uint16_t div_16)
@@ -1079,7 +1719,15 @@ uint8_t BCD_4(uint16_t int_16,uint16_t div_16)
 
  }
  //****************************Timer Functions**************************
- void Timer0_init()
+ 
+ /****************************************************************************************************
+**  Function Prototype: vvoid Timer0_init(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function for timer0 initilisation
+*****************************************************************************************************/
+ void Timer0_init(void)
 {
   // Set divider 
   My_timer = timerBegin(0, 80, true);
@@ -1088,11 +1736,26 @@ uint8_t BCD_4(uint16_t int_16,uint16_t div_16)
   timerAlarmEnable(My_timer); //Just Enable           // Enable timer 
 }
 //******************** Functions For Freq Timer ************************************************
- void IRAM_ATTR Timer1_Interrupt()  
+/****************************************************************************************************
+**  Function Prototype: void IRAM_ATTR Timer1_Interrupt(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : ISR routine for timer-1
+*****************************************************************************************************/
+ void IRAM_ATTR Timer1_Interrupt(void)  
 {
   f1  = 1;      // set flag in interrupt 
 }
-void GPIO_Setup()
+
+/****************************************************************************************************
+**  Function Prototype: void GPIO_Setup(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to initialize all gpio pins
+*****************************************************************************************************/
+void GPIO_Setup(void)
 {
   // SET pin direction as output
     pinMode(PIN1, OUTPUT);              //  Make pin as output
@@ -1133,6 +1796,9 @@ void GPIO_Setup()
     pinMode(ADD3,INPUT);
     pinMode(ADD3,INPUT_PULLUP);
 
+    pinMode(REED_SWITCH,INPUT);
+    pinMode(REED_SWITCH,INPUT_PULLUP);
+
     pinMode(ADD4,INPUT);
     pinMode(ADD4,INPUT_PULLUP);
 
@@ -1145,7 +1811,15 @@ void GPIO_Setup()
     digitalWrite(RED_LED,LOW);
 }
 
-void Timer1_init()
+
+/****************************************************************************************************
+**  Function Prototype: void Timer1_init(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to initialize timer 1 for excitation frequency
+*****************************************************************************************************/
+void Timer1_init(void)
 {
   // Set divider 
   Freq_timer = timerBegin(1, 80, true); 
@@ -1247,6 +1921,13 @@ void Timer1_init()
 //timerAlarmEnable(Freq_timer); //Just Enable           // Enable timer 
 }
 
+/****************************************************************************************************
+**  Function Prototype: void printIntArray(unsigned int* arr, int size) 
+**  Passed Parameter  : array adress, size of array
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to print integer array
+*****************************************************************************************************/
 void printIntArray(unsigned int* arr, int size) 
 {
   for (int i = 0; i < size; i++) {
@@ -1256,7 +1937,15 @@ void printIntArray(unsigned int* arr, int size)
   Serial.println();
 }
 //*-*-*-*-*-*-*-*-*-*-*-*-
- void Recall_Memory()
+
+/****************************************************************************************************
+**  Function Prototype: void Recall_Memory(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read eeprom memory for configuration and calibration parameters
+*****************************************************************************************************/
+ void Recall_Memory(void)
  {
         float retrievedFloatValue;
         unsigned char floatBytes3[5];
@@ -1490,7 +2179,7 @@ void printIntArray(unsigned int* arr, int size)
                 }
                 P10_Adc_Count = 1500;
 
-                EEPROM_Save[25] = Calibration_Points;;
+                EEPROM_Save[25] = Calibration_Points;
 
                 EEPROM_Save[27] = (Calibration_P1_start >>8) & 0xff;   // msb
                 EEPROM_Save[26] = Calibration_P1_start & 0xff;
@@ -1577,6 +2266,7 @@ void printIntArray(unsigned int* arr, int size)
           }  
           else
           {
+              int i;
              // Pipe_Size = 2;
               Serial.println("Reading from memory");
               Calibration_Points = EEPROM_Save[25];     //no of calibration points
@@ -1610,11 +2300,45 @@ void printIntArray(unsigned int* arr, int size)
               //----------------------------------------------------------------------------------------------------------------------------------
               Calibration_P10_start = (EEPROM_Save[63] << 8) |EEPROM_Save[62];       //cal10 start point
               //-------------------------------------------------------------------------------------------
-              
+             Serial.println("\nDevice Serial no:");
+             for (i = 0; i < 25; i++) 
+             {
+                   Device_Serial_no[i] = EEPROM_Save[i + SERIAL_NO_ADD - EEPROM_ADDR];
+                   Serial.write(Device_Serial_no[i]);
+                   if (Device_Serial_no[i] == '#') break;
+              }
+              Device_Serial_no[i] = '\0';
+              Serial.println();
+
+            Serial.println("\nPCB Serial no:");
+             for (i = 0; i < 25; i++) 
+             {
+                   Pcb_Serial_no[i] = EEPROM_Save[i + PCB_NO_ADD - EEPROM_ADDR];
+                   Serial.write(Pcb_Serial_no[i]);
+                  if (Pcb_Serial_no[i] == '#') break;
+            }
+            Serial.println();
+
+            Serial.println("\nFlow Tube Serial no:");
+             for (i = 0; i < 25; i++) 
+             {
+                   Flowtube_Serial_no[i] = EEPROM_Save[i + FLOW_TUBE_ADD - EEPROM_ADDR];
+                   Serial.write(Flowtube_Serial_no[i]);
+                   if (Flowtube_Serial_no[i] == '#') break;
+            }
+            Serial.println();
+
           }
  }
 //*-*-*-*-*-*- 19_02_24
- void Pipe_Size_Selection()
+ /************************************************************************************************
+**  Function Prototype: void Pipe_Size_Selection(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to select pipe size gain using multiplexer
+**************************************************************************************************/
+ void Pipe_Size_Selection(void)
  {
    switch(Pipe_Size)
    {
@@ -1642,6 +2366,14 @@ void printIntArray(unsigned int* arr, int size)
    }
 
  }
+
+ /************************************************************************************************
+**  Function Prototype: float  Form_Multiplier(unsigned char* str,unsigned int Start,unsigned int End )
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to send configuration parameters serially
+**************************************************************************************************/
 // This function generates a float number from values in buffer 
 float  Form_Multiplier(unsigned char* str,unsigned int Start,unsigned int End )
  {
@@ -1680,7 +2412,15 @@ float  Form_Multiplier(unsigned char* str,unsigned int Start,unsigned int End )
     Serial.println("Invalid string format!");
   }*/
 }
-void Update_Config()
+
+/************************************************************************************************
+**  Function Prototype: void Update_Config(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to send configuration parameters serially
+**************************************************************************************************/
+void Update_Config(void)
 {
   //unsigned char Config_Buffer[100]="$ST062 ET070 EF00.00 SD00.00 G1 F00.123&";
 Config_Buffer[0] = '$'; // Start of string
@@ -1787,7 +2527,13 @@ else if(Pipe_Size == 3)
 
 }
 
-
+/************************************************************************************************
+**  Function Prototype: void Write_Config_Received(unsigned char* Rx_Buffer)
+**  Passed Parameter  : Receive buffer
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read configuration serially and store to eeprom
+**************************************************************************************************/
 void Write_Config_Received(unsigned char* Rx_Buffer)
 {
                 Recieve_ADC_Read_Delay   =  ((Rx_Buffer[3]&0x0f)*100); 
@@ -1920,7 +2666,15 @@ void Write_Config_Received(unsigned char* Rx_Buffer)
               
 
 }
-void Flow_Rate_Calculation()
+
+/************************************************************************************************
+**  Function Prototype: void Flow_Rate_Calculation(void )
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to calculate flow rate
+**************************************************************************************************/
+void Flow_Rate_Calculation(void )
 {
       long int temp = 0;
       
@@ -2004,6 +2758,14 @@ void Flow_Rate_Calculation()
           Pulse_Freq[8]='@';
 }
 
+
+/************************************************************************************************
+**  Function Prototype: void Check_Calibration_string(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read calibration parameters serially and store in the eeprom
+**************************************************************************************************/
 void Check_Calibration_string(void)
 {
 
@@ -2339,6 +3101,14 @@ void Check_Calibration_string(void)
 
               //while(1);
 }
+
+/*********************************************************************
+**  Function Prototype: void SEND_CAL_DATA(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to send calibration data serially
+**********************************************************************/
 void SEND_CAL_DATA(void)
 {
       char buffer[250];
@@ -2576,6 +3346,14 @@ void SEND_CAL_DATA(void)
       
       
 }
+
+/*****************************************************************************************************
+**  Function Prototype: void CONVERT_INTEGER_ASCII(unsigned long int TEMP1)
+**  Passed Parameter  : long int value
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to convert integer to ascii
+******************************************************************************************************/
 void CONVERT_INTEGER_ASCII(unsigned long int TEMP1)
 {
       unsigned long int TEMP = 0;
@@ -2606,6 +3384,14 @@ void CONVERT_INTEGER_ASCII(unsigned long int TEMP1)
       POS = TEMP % 10;
       LOAD6 = 0x30 + POS;
 }
+
+/*****************************************************************************************************
+**  Function Prototype: void Calibrate_PWM(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to decide calibration zone based on delta and calibration points
+******************************************************************************************************/
 void Calibrate_PWM(void)
 {
       float NA_Flow=800.0;
@@ -2943,6 +3729,16 @@ void Calibrate_PWM(void)
         
 }
 
+/**************************************************************************************************************************************************
+**  Function Prototype: unsigned int Calculate_Flow_Rate(unsigned int adc_low,unsigned int adc_high,unsigned int flow_low ,unsigned int flow_high)
+**  Passed Parameter  : adc low: 
+                        adc high:
+                        flow low:
+                        flow high:
+**  Returned Parameter: Calculated Flow rate
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to calculate flow rate
+*****************************************************************************************************************************************************/
 unsigned int Calculate_Flow_Rate(unsigned int adc_low,unsigned int adc_high,unsigned int flow_low ,unsigned int flow_high)
 {
 
@@ -2965,6 +3761,16 @@ unsigned int Calculate_Flow_Rate(unsigned int adc_low,unsigned int adc_high,unsi
     return flow;
 }
 
+/****************************************************************************************************************************
+**  Function Prototype: unsigned int Calculate_Flow_Rate1(unsigned int adc_low,unsigned int adc_high,unsigned int flow_low ,unsigned int flow_high)
+**  Passed Parameter  : adc low: 
+                        adc high:
+                        flow low:
+                        flow high:
+**  Returned Parameter: Calculated Flow rate
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to calculate flow rate for readings above calibration values
+*****************************************************************************************************************************/
 unsigned int Calculate_Flow_Rate1(unsigned int adc_low,unsigned int adc_high,unsigned int flow_low ,unsigned int flow_high)
 {
 
@@ -2987,6 +3793,13 @@ unsigned int Calculate_Flow_Rate1(unsigned int adc_low,unsigned int adc_high,uns
     return flow;
 }
 
+ /***************************************************************************************************
+**  Function Prototype: void Set_Frequency(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to read output frequency command over serially and store to eeprom
+****************************************************************************************************/
  void Set_Frequency(void)
  {
       //#FC1234@
@@ -3017,6 +3830,14 @@ unsigned int Calculate_Flow_Rate1(unsigned int adc_low,unsigned int adc_high,uns
       EEPROM.commit();
       
  }
+
+ /***************************************************************************************************
+**  Function Prototype: void Send_Freq(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to send output frequency setting serially
+****************************************************************************************************/
 void Send_Freq(void)
 {
       unsigned char buffer_counter = 0;
@@ -3036,11 +3857,27 @@ void Send_Freq(void)
       Serial.println(buffer);
 }
 
-void IRAM_ATTR onTimer() 
+
+/***************************************************************************************************
+**  Function Prototype: void IRAM_ATTR onTimer(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : ISR routine for timer 2
+****************************************************************************************************/
+void IRAM_ATTR onTimer(void) 
 {
     Check_Empty_Flow = 1;  // Set flag when timer fires
 }
 
+
+/***************************************************************************************************
+**  Function Prototype: void Timer2_init(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function to initialise timer 2 for 30 seconds to detect empty pipe 
+****************************************************************************************************/
 void Timer2_init(void)
 {
       // Create a timer (Timer 0, Divider = 80, Count Up)
@@ -3057,14 +3894,28 @@ void Timer2_init(void)
     timerAlarmEnable(Empty_Flow_timer);
 }
 
+/***************************************************************************************************
+**  Function Prototype: void IRAM_ATTR caluartISR(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : ISR routine for serial 0 port
+****************************************************************************************************/
 void IRAM_ATTR caluartISR(void)
 {
     Rx_Cal_Int_Flag=1;
 }
 
+
+/***************************************************************************************************
+**  Function Prototype: void Read_485_Address(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function To create device RS485 address for RS485 communication
+****************************************************************************************************/
 void Read_485_Address(void)
 {
-     
      unsigned char add1,add2,add3,add4;
 
      add1 = digitalRead(ADD1);
@@ -3119,6 +3970,13 @@ void Read_485_Address(void)
     //Serial.println(RS_485_addr);
 }
 
+/***************************************************************************************************
+**  Function Prototype: void Calibration_Process(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function To decode received command over RS485 and take appropriate action
+****************************************************************************************************/
 void Calibration_Process(void)
 {
       unsigned char val1,val2,val3,val4,val5;
@@ -3128,9 +3986,18 @@ void Calibration_Process(void)
           if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'F')
           {
                   Serial.println("\nreading configuration \n");
-                  Read_Configuration();
+                  val1 = Cal_Rcvd_Data[3] - 0x30; 
+                  val2 = Cal_Rcvd_Data[4] - 0x30;
+
+                  final_val = (val1 * 10) + val2;
+
+                  if(final_val == RS_485_addr)
+                  {
+                      Read_Configuration();
+                  }
+                  
           }
-          if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'S')
+          else if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'S')
           {
                 Calibration_on = 1;
                 Calibration_counter = 0;
@@ -3145,6 +4012,46 @@ void Calibration_Process(void)
 
                   Store_calb_data();
           }
+          else if(Cal_Rcvd_Data[1] == 'C' && Cal_Rcvd_Data[2] == 'P')
+          {
+                  Serial.print("\nCalibration points:\n");
+
+                  val1 = Cal_Rcvd_Data[3] - 0x30; 
+                  val2 = Cal_Rcvd_Data[4] - 0x30;
+
+                  final_val = (val1 * 10) + val2;
+
+                  if(final_val == RS_485_addr)
+                  {
+                        //Serial.println("\naddress matched \n");
+                        val1 = Cal_Rcvd_Data[6] - 0x30; 
+                        val2 = Cal_Rcvd_Data[7] - 0x30;
+
+                        final_val = (val1 * 10) + val2;
+
+                        if(final_val >= 1 && final_val <= 10)
+                        {
+                            Calibration_Points = final_val;
+
+                            EEPROM_Save[25] = Calibration_Points;
+
+                              for (int i = 0; i < EEPROM_SIZE; i++) 
+                              {
+                                      EEPROM.write(EEPROM_ADDR + i, EEPROM_Save[i]);
+                              }
+                              // EEPROM.put(10, PWM_Multiplier);
+                              EEPROM.commit();
+
+                            Serial.println(Calibration_Points);
+
+                            digitalWrite(RS_485_RX_TX,1);
+                            Send_ok();
+                            digitalWrite(RS_485_RX_TX,0);
+
+
+                        }
+                  }   
+          }
           else if(Cal_Rcvd_Data[1] == 'F')
           {
                 
@@ -3152,31 +4059,58 @@ void Calibration_Process(void)
 
                 val1 = Cal_Rcvd_Data[2] - 0x30; 
                 val2 = Cal_Rcvd_Data[3] - 0x30;
-                Calibration_counter = (val1 * 10) + val2;
 
-                val1 = Cal_Rcvd_Data[12] - 0x30; 
-                val2 = Cal_Rcvd_Data[13] - 0x30;
+                final_val = (val1 * 10) + val2;
+
+                if(final_val == RS_485_addr)    //*F01,01,01234#
+                {
+
+                      val1 = Cal_Rcvd_Data[5] - 0x30; 
+                      val2 = Cal_Rcvd_Data[6] - 0x30; 
+
+                     Calibration_counter = (val1 * 10) + val2;
+
+                    digitalWrite(RS_485_RX_TX,1);
+                    Send_ok();
+                    digitalWrite(RS_485_RX_TX,0);
+
+                    val1 = Cal_Rcvd_Data[8] - 0x30; 
+                    val2 = Cal_Rcvd_Data[9] - 0x30;
+                    val3 = Cal_Rcvd_Data[10] - 0x30;
+                    val4 = Cal_Rcvd_Data[11] - 0x30;
+                    val5 = Cal_Rcvd_Data[12] - 0x30;
+
+                    final_val = (val1 * 10000) + (val2 * 1000) + (val3 * 100) + (val4 * 10) + val5;
+
+                    Serial.println("\n received flow: \n");
+
+                    Serial.println(final_val);
+
+                    Calibration_flow[Calibration_counter] = final_val;
+                    Calibration_adc[Calibration_counter] = Delta;
+
+                    Serial.println("\n calibration Counter: \n");
+
+                    Serial.println(Calibration_counter);
+                }
+          }
+          else if(Cal_Rcvd_Data[1] == 'R' && Cal_Rcvd_Data[2] == 'C'  && Cal_Rcvd_Data[3] == 'F')
+          {
+                Serial.println("\nsendinG configuration \n");
+
+                val1 = Cal_Rcvd_Data[4] - 0x30; 
+                val2 = Cal_Rcvd_Data[5] - 0x30;
 
                 final_val = (val1 * 10) + val2;
 
                 if(final_val == RS_485_addr)
                 {
-                    digitalWrite(RS_485_RX_TX,1);
-                    Send_ok();
-                    digitalWrite(RS_485_RX_TX,0);
-
-                    val1 = Cal_Rcvd_Data[5] - 0x30; 
-                    val2 = Cal_Rcvd_Data[6] - 0x30;
-                    val3 = Cal_Rcvd_Data[8] - 0x30;
-                    val4 = Cal_Rcvd_Data[9] - 0x30;
-                    val5 = Cal_Rcvd_Data[10] - 0x30;
-
-                    final_val = (val1 * 10000) + (val2 * 1000) + (val3 * 100) + (val4 * 10) + val5;
-
-                    Calibration_flow[Calibration_counter] = final_val;
-                    READ_FLOW = Get_Flow();
-                    Calibration_adc[Calibration_counter] = Delta;
+                      //Serial.println("\naddress matched \n");
+                      digitalWrite(RS_485_RX_TX,1);
+                      Send_Configuration();
+                      digitalWrite(RS_485_RX_TX,0);
                 }
+                
           }
           else if(Cal_Rcvd_Data[1] == 'R' && Cal_Rcvd_Data[2] == 'F')
           {
@@ -3198,8 +4132,8 @@ void Calibration_Process(void)
           else if(Cal_Rcvd_Data[1] == 'G' && Cal_Rcvd_Data[2] == 'E' && Cal_Rcvd_Data[3] == 'T' && Cal_Rcvd_Data[4] == 'C')
           {
                 Serial.println("\n sending configuration \n");
-                val1 = Cal_Rcvd_Data[3] - 0x30; 
-                val2 = Cal_Rcvd_Data[4] - 0x30;
+                val1 = Cal_Rcvd_Data[5] - 0x30; 
+                val2 = Cal_Rcvd_Data[6] - 0x30;
 
                 final_val = (val1 * 10) + val2;
 
@@ -3222,9 +4156,10 @@ void Calibration_Process(void)
                 {
                     count = 6;
                     count1 = 0;
-                    while(Cal_Rcvd_Data[count] != '#')
+                    while(Cal_Rcvd_Data[count] != '#' && count1 < 25)
                     {
                           Device_Serial_no[count1] = Cal_Rcvd_Data[count];
+                          //Serial.write(Device_Serial_no[count1]);
                           count++;count1++;
                     }
                     count1++;
@@ -3233,8 +4168,19 @@ void Calibration_Process(void)
                       digitalWrite(RS_485_RX_TX,1);
                       Send_ok();
                       digitalWrite(RS_485_RX_TX,0);
+                     
+                      
+                      for (int i = 0; i < 25; i++) 
+                      {
+                            EEPROM_Save[SERIAL_NO_ADD+i] = Device_Serial_no[i];
+                      }
 
                       Store_serial_no();
+
+                        // Print for confirmation
+                      Serial.print("\nStored Serial No: ");
+                      for(count1 = 0;count1<25;count1++)
+                          Serial.write(Device_Serial_no[count1]);
                 }
 
           }
@@ -3242,8 +4188,8 @@ void Calibration_Process(void)
           {
                 Serial.println("\nsetting pcb serial no \n");
 
-                val1 = Cal_Rcvd_Data[3] - 0x30; 
-                val2 = Cal_Rcvd_Data[4] - 0x30;
+                val1 = Cal_Rcvd_Data[4] - 0x30; 
+                val2 = Cal_Rcvd_Data[5] - 0x30;
 
                 final_val = (val1 * 10) + val2;
 
@@ -3251,19 +4197,29 @@ void Calibration_Process(void)
                 {
                     count = 7;
                     count1 = 0;
-                    while(Cal_Rcvd_Data[count] != '#')
+                    while(Cal_Rcvd_Data[count] != '#' && count1 < 25)
                     {
                           Pcb_Serial_no[count1] = Cal_Rcvd_Data[count];
                           count++;count1++;
                     }
-                    count1++;
-                    Device_Serial_no[count1] = '#';
+                    //count1++;
+                    Pcb_Serial_no[count1] = '#';
                     
                       digitalWrite(RS_485_RX_TX,1);
                       Send_ok();
                       digitalWrite(RS_485_RX_TX,0);
 
+                      for (int i = 0; i < 25; i++) 
+                      {
+                            EEPROM_Save[PCB_NO_ADD+i] = Pcb_Serial_no[i];
+                      }
+
                       Store_pcb_serial_no();
+
+                       // Print for confirmation
+                      Serial.print("\nStored pcb Serial No: ");
+                      for(count1 = 0;count1<25;count1++)
+                          Serial.write(Pcb_Serial_no[count1]);
                 }
 
           }
@@ -3271,8 +4227,8 @@ void Calibration_Process(void)
           {
                 Serial.println("\nsetting flow tube serial no \n"); 
 
-                val1 = Cal_Rcvd_Data[3] - 0x30; 
-                val2 = Cal_Rcvd_Data[4] - 0x30;
+                val1 = Cal_Rcvd_Data[4] - 0x30; 
+                val2 = Cal_Rcvd_Data[5] - 0x30;
 
                 final_val = (val1 * 10) + val2;
 
@@ -3280,19 +4236,29 @@ void Calibration_Process(void)
                 {
                     count = 7;
                     count1 = 0;
-                    while(Cal_Rcvd_Data[count] != '#')
+                    while(Cal_Rcvd_Data[count] != '#' && count1 < 25)
                     {
                           Flowtube_Serial_no[count1] = Cal_Rcvd_Data[count];
                           count++;count1++;
                     }
-                    count1++;
-                    Device_Serial_no[count1] = '#';
+                    //count1++;
+                    Flowtube_Serial_no[count1] = '#';
                     
                       digitalWrite(RS_485_RX_TX,1);
                       Send_ok();
                       digitalWrite(RS_485_RX_TX,0);
 
+                      for (int i = 0; i < 25; i++) 
+                      {
+                            EEPROM_Save[FLOW_TUBE_ADD+i] = Flowtube_Serial_no[i];
+                      }
+
                       Store_flow_tube_serial_no();
+
+                       // Print for confirmation
+                      Serial.print("\nStored pcb Serial No: ");
+                      for(count1 = 0;count1<25;count1++)
+                          Serial.write(Flowtube_Serial_no[count1]);
                 }
 
           }
@@ -3315,9 +4281,16 @@ void Calibration_Process(void)
           Flush_Rx_Buffer();   
 } 
 
+/************************************************************************************
+**  Function Prototype: void Store_calb_data(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function To store received calibration data in to eeprom
+*************************************************************************************/
 void Store_calb_data(void)
 {
-     Calibration_P2_start = Calibration_flow[1];
+        Calibration_P2_start = Calibration_flow[1];
         P2_Adc_Count = Calibration_adc[1];
 
         Calibration_P3_start = Calibration_flow[2];
@@ -3405,88 +4378,133 @@ void Store_calb_data(void)
         // EEPROM.put(10, PWM_Multiplier);
         EEPROM.commit();
 }
+
+/************************************************************************************
+**  Function Prototype: void Send_ok(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function To send ok acknowledment over RS485
+*************************************************************************************/
  void Send_ok(void)
  {
     unsigned char STRING[10];
     unsigned char cnt;
-    STRING[0] = ' ';
+    STRING[0] = '*';
     STRING[1] = 'O';
     STRING[2] = 'K';
 
     STRING[3] = (RS_485_addr / 10) + '0';  
     STRING[4] = (RS_485_addr % 10) + '0';  
-    STRING[5] = '\0'; // Null terminator if needed for string functions
+    STRING[5] = '/n'; // Null terminator if needed for string functions
 
     // Send each character with 1ms delay
     for (cnt = 0; cnt <= 4; cnt++) 
     {
       MySerial.write(STRING[cnt]);
-      delay(1);
+      //Serial.write(STRING[cnt]);
+      delay(5);
     }
 }
- unsigned int Get_Flow(void)
- {
 
- }
+ /************************************************************************************
+**  Function Prototype: void Send_flow(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function To send flow rate over RS485
+*************************************************************************************/
  void Send_flow(void)
- {
-        unsigned char STRING[15];
+{
+    unsigned char STRING[20]; // Make slightly larger for safety
+    char flow_buffer[10];
+    unsigned char string_counter = 0;
 
-        Calibrate_PWM();
+    // Prepare flow data
+    dtostrf(Flow_Rate, 5, 2, flow_buffer);  // e.g., "12.34"
 
-        STRING[0] = ' ';
-        STRING[1] = 'F';
+    // Header
+    STRING[string_counter++] = ' ';
+    STRING[string_counter++] = 'F';
+    STRING[string_counter++] = (RS_485_addr / 10) + '0'; 
+    STRING[string_counter++] = (RS_485_addr % 10) + '0'; 
+    STRING[string_counter++] = ',';
 
-        char LOAD5, LOAD6;
-    
-        STRING[2] = (RS_485_addr / 10) + '0'; 
-        STRING[3] = (RS_485_addr % 10) + '0'; 
-        STRING[4] = ',';
+    // Copy float string
+    for (int i = 0; flow_buffer[i] != '\0'; i++) 
+    {
+        STRING[string_counter++] = flow_buffer[i];
+    }
 
-        char LOAD2, LOAD3, LOAD4;
-        Convert_flow_ascii(Flow_Rate, LOAD2, LOAD3, LOAD4, LOAD5, LOAD6);
-        STRING[5] = LOAD2;
-        STRING[6] = LOAD3;
-        STRING[8] = LOAD4;
-        STRING[9] = LOAD5;
-        STRING[10] = LOAD6; 
+    // Optional: add end character
+    //STRING[string_counter++] = '#'; // or \n or \r, etc.
 
-        for (int cnt = 0; cnt <= 10; cnt++)
-         {
-          MySerial.write(STRING[cnt]);
-          delay(1); 
-        }
+    // Send out the data
+    for (int cnt = 0; cnt < string_counter; cnt++) 
+    {
+        MySerial.write(STRING[cnt]);
+        Serial.write(STRING[cnt]);
+        delay(5); 
+    }
 
-        delay(100); 
- }
+    Serial.println(); // for clarity
+}
 
+/************************************************************************************
+**  Function Prototype: void Store_serial_no(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : Function To store device serial no in EEPROM
+*************************************************************************************/
 void Store_serial_no(void)
 {
     for (int i = 0; i < 25; i++) 
     {
-        EEPROM.write(SERIAL_NO_ADD + i, EEPROM_Save[i]); 
+        EEPROM.write(SERIAL_NO_ADD + i, EEPROM_Save[SERIAL_NO_ADD + i]); 
     }
-    EEPROM.commit(); // Save changes
+    EEPROM.commit(); 
 }
 
+/************************************************************************************
+**  Function Prototype: void Store_pcb_serial_no(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To store PCB serial no in EEPROM
+*************************************************************************************/
 void Store_pcb_serial_no(void)
 {
     for (int i = 0; i < 25; i++) 
     {
-        EEPROM.write(PCB_NO_ADD + i, EEPROM_Save[i]); 
+         EEPROM.write(PCB_NO_ADD + i, EEPROM_Save[PCB_NO_ADD + i]); 
     }
     EEPROM.commit(); // Save changes
 }
 
+/************************************************************************************
+**  Function Prototype: void Store_flow_tube_serial_no(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To store flow tube serial no in EEPROM
+*************************************************************************************/
 void Store_flow_tube_serial_no(void)
 {
     for (int i = 0; i < 25; i++) 
     {
-        EEPROM.write(FLOW_TUBE_ADD + i, EEPROM_Save[i]); 
+         EEPROM.write(FLOW_TUBE_ADD + i, EEPROM_Save[FLOW_TUBE_ADD + i]);   
     }
     EEPROM.commit(); // Save changes
 }
 
+/************************************************************************************
+**  Function Prototype: void Flush_Rx_Buffer(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To clear Cal_Rcvd_Data array
+*************************************************************************************/
 void Flush_Rx_Buffer(void)
 {
       unsigned char count;
@@ -3495,6 +4513,15 @@ void Flush_Rx_Buffer(void)
             Cal_Rcvd_Data[count] = 0;
       }
 } 
+
+/***************************************************************************************************************
+**  Function Prototype: void Convert_flow_ascii(float flow, char &d1, char &d2, char &d3, char &d4, char &d5) 
+**  Passed Parameter  : Flow: Current flow rate
+                        d1 - d5: Ascii charecter address
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To connver flow rate to ascii
+***************************************************************************************************************/
 
 void Convert_flow_ascii(float flow, char &d1, char &d2, char &d3, char &d4, char &d5) 
 {
@@ -3507,6 +4534,14 @@ void Convert_flow_ascii(float flow, char &d1, char &d2, char &d3, char &d4, char
   d5 = (pres % 10) + '0';         // hundredths
 }
 
+
+/************************************************************************************
+**  Function Prototype: void Read_Configuration(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To read configuration data over RS485 and strore it in eeprom
+*************************************************************************************/
 void Read_Configuration(void)
 {
        //*CF01,PS01,OF1234,ZF1234,ST55,EN70,ZFR1234,EF01#
@@ -3519,7 +4554,7 @@ void Read_Configuration(void)
 
       final_val = (val1 * 10) + val2;
 
-      if(final_val == RS_485_addr)
+      //if(final_val == RS_485_addr)
       {
           if(Cal_Rcvd_Data[6] == 'P' &&  Cal_Rcvd_Data[7] == 'S')   //PIPE SIZE
           {
@@ -3531,7 +4566,13 @@ void Read_Configuration(void)
                    if(final_val > 0 && final_val <= 2)
                    {
                         Pipe_Size = final_val;
+
+                        EEPROM_Save[12]= Pipe_Size;
                    }
+                   Serial.print("Pipe Size: ");
+                  Serial.println(Pipe_Size);
+
+                   //while(1);
                    if(Pipe_Size == 1)    //25nb
                     {
                           FLOW_RATE_RANGE = 10000;
@@ -3563,6 +4604,14 @@ void Read_Configuration(void)
 
                   PWM_RANGE = final_val;
                   Pwm_Calculator_Val = float (FLOW_RATE_RANGE / PWM_RANGE);   //factor to calculate pwm frequency
+
+                   Serial.print("Output frequency: ");
+                   Serial.println(PWM_RANGE);
+
+                    EEPROM_Save[22] = (PWM_RANGE >>8) & 0xff;   // msb
+                    EEPROM_Save[21] = PWM_RANGE & 0xff;
+
+                   //while(1);
                    
           }
           if(Cal_Rcvd_Data[18] == 'Z' &&  Cal_Rcvd_Data[19] == 'F')   //zero flow 
@@ -3575,6 +4624,14 @@ void Read_Configuration(void)
                   final_val = (val1 * 1000) + (val2 * 100) + (val3 * 10) + val4;
 
                   Zero_Flow_Offset = final_val;   
+
+                   Serial.print("Zero Flow Offset: ");
+                   Serial.println(Zero_Flow_Offset);
+
+                  EEPROM_Save[18] =(Zero_Flow_Offset>>8) & 0xff;   // msb
+                  EEPROM_Save[17] = Zero_Flow_Offset & 0xff;         //lsb   
+
+                  // while(1);
           }
           if(Cal_Rcvd_Data[25] == 'S' &&  Cal_Rcvd_Data[26] == 'T')   //START TIME
           {
@@ -3583,7 +4640,14 @@ void Read_Configuration(void)
 
                   final_val = (val1 * 10) + val2;
                   
-                  Recieve_ADC_Read_Delay = final_val;       
+                  Recieve_ADC_Read_Delay = final_val;    
+
+                  Serial.print("Start time: ");
+                  Serial.println(Recieve_ADC_Read_Delay);
+
+                  EEPROM_Save[2] = (Recieve_ADC_Read_Delay>>8) & 0xff;   // msb
+                  EEPROM_Save[1]= Recieve_ADC_Read_Delay & 0xff;            //lsb
+  
           }
 
           if(Cal_Rcvd_Data[30] == 'E' &&  Cal_Rcvd_Data[31] == 'N')   //END TIME
@@ -3593,7 +4657,13 @@ void Read_Configuration(void)
 
                   final_val = (val1 * 10) + val2;
                   
-                  Recieve_ADC_Read_Delay = final_val;       
+                  Recieve_ADC_Read_Stop_Delay = final_val;    
+
+                  Serial.print("end time: ");
+                  Serial.println(Recieve_ADC_Read_Stop_Delay);
+
+                  EEPROM_Save[4] = (Recieve_ADC_Read_Stop_Delay>>8) & 0xff;   // msb
+                  EEPROM_Save[3]= Recieve_ADC_Read_Stop_Delay & 0xff;         //lsb
           }
 
           if(Cal_Rcvd_Data[35] == 'Z' &&  Cal_Rcvd_Data[36] == 'F' &&  Cal_Rcvd_Data[37] == 'R')   //ZERO FLOW VALUE
@@ -3606,6 +4676,14 @@ void Read_Configuration(void)
                    final_val = (val1 * 1000) + (val2 * 100) + (val3 * 10) + val4;
 
                   Zero_Flow_rate_val = final_val;  
+
+                  Serial.print("Zero flow value: ");
+                  Serial.println(Zero_Flow_rate_val);
+
+                  //zero flow rate value 
+                  EEPROM_Save[67] = (Zero_Flow_rate_val >>8) & 0xff;   // msb
+                  EEPROM_Save[66] = Zero_Flow_rate_val & 0xff;
+
           }
 
           if(Cal_Rcvd_Data[43] == 'E' &&  Cal_Rcvd_Data[44] == 'F')   //EXITATATION FREQUENCY
@@ -3615,10 +4693,24 @@ void Read_Configuration(void)
 
                   final_val = (val1 * 10) + val2;
                   
-                  Excitation_Frequency  = final_val;       
+                  Excitation_Frequency  = final_val;    
+  
 
-                  Timer1_init();
+                  Serial.print("Excitation Frequency: ");
+                  Serial.println(Excitation_Frequency);
+
+                  EEPROM_Save[7] = Excitation_Frequency;
+                   //while(1);
+
+                  //Timer1_init();
           }
+
+          for (int i = 0; i < EEPROM_SIZE; i++) 
+          {
+                  EEPROM.write(EEPROM_ADDR + i, EEPROM_Save[i]);
+          }
+          // EEPROM.put(10, PWM_Multiplier);
+          EEPROM.commit();
 
           digitalWrite(RS_485_RX_TX,1);
           Send_ok();
@@ -3626,11 +4718,17 @@ void Read_Configuration(void)
       }
 
 }
-
+/************************************************************************************
+**  Function Prototype: void Send_Configuration(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To send configuration data over RS485 in response to command
+*************************************************************************************/
 void Send_Configuration(void)
 {
-        unsigned char STRING[50];
-        char LOAD1, LOAD2, LOAD3, LOAD4,LOAD5, LOAD6;
+        unsigned char STRING[200];
+        //char LOAD1, LOAD2, LOAD3, LOAD4,LOAD5, LOAD6;
         unsigned char count,count1;
         unsigned char string_counter = 0;
         unsigned int string_size;
@@ -3657,7 +4755,8 @@ void Send_Configuration(void)
         STRING[++string_counter] = 'O';
         STRING[++string_counter] = 'F';
 
-        Convert_flow_ascii(PWM_RANGE, LOAD2, LOAD3, LOAD4, LOAD5, LOAD6);
+        CONVERT_INTEGER_ASCII(PWM_RANGE);
+  
         STRING[++string_counter] = LOAD3;
         STRING[++string_counter] = LOAD4;
         STRING[++string_counter] = LOAD5;
@@ -3665,10 +4764,10 @@ void Send_Configuration(void)
         STRING[++string_counter] = ',';
 
         //ZERO FLOW OFFSET
-        STRING[++string_counter] = 'O';
+        STRING[++string_counter] = 'Z';
         STRING[++string_counter] = 'F';
 
-        Convert_flow_ascii(Zero_Flow_Offset, LOAD2, LOAD3, LOAD4, LOAD5, LOAD6);
+        CONVERT_INTEGER_ASCII(Zero_Flow_Offset);
         STRING[++string_counter] = LOAD3;
         STRING[++string_counter] = LOAD4;
         STRING[++string_counter] = LOAD5;
@@ -3696,7 +4795,7 @@ void Send_Configuration(void)
         STRING[++string_counter] = 'F';
         STRING[++string_counter] = 'R';
 
-        Convert_flow_ascii(Zero_Flow_rate_val, LOAD2, LOAD3, LOAD4, LOAD5, LOAD6);
+        CONVERT_INTEGER_ASCII(Zero_Flow_rate_val);
         STRING[++string_counter] = LOAD3;
         STRING[++string_counter] = LOAD4;
         STRING[++string_counter] = LOAD5;
@@ -3715,11 +4814,13 @@ void Send_Configuration(void)
         STRING[++string_counter] = 'S';
         STRING[++string_counter] = 'R';
 
-        string_counter++;
-        for(count = 0,count1=string_counter;count<25;count++,count1++)
-        {
-            STRING[count1] = Device_Serial_no[count];
-        }
+        //string_counter++;
+       for (int i = 0; i < 25; i++) 
+       {
+            if (Device_Serial_no[i] == '#') break;
+            STRING[++string_counter] = Device_Serial_no[i];  // increment + copy
+       }
+        string_counter--;
         STRING[++string_counter] = ',';
 
         //PCB SERIAL NO
@@ -3727,10 +4828,11 @@ void Send_Configuration(void)
         STRING[++string_counter] = 'S';
         STRING[++string_counter] = 'R';
 
-        string_counter++;
-        for(count = 0,count1=string_counter;count<25;count++,count1++)
+        //string_counter++;
+        for (int i = 0; i < 25; i++) 
         {
-            STRING[count1] = Pcb_Serial_no[count];
+            if (Pcb_Serial_no[i] == '#') break;
+            STRING[++string_counter] = Pcb_Serial_no[i];
         }
         STRING[++string_counter] = ',';
 
@@ -3739,10 +4841,11 @@ void Send_Configuration(void)
         STRING[++string_counter] = 'S';
         STRING[++string_counter] = 'R';
 
-        string_counter++;
-        for(count = 0,count1=string_counter;count<25;count++,count1++)
+        //string_counter++;
+        for (int i = 0; i < 25; i++)
         {
-            STRING[count1] = Flowtube_Serial_no[count];
+            if (Flowtube_Serial_no[i] == '#') break;
+            STRING[++string_counter] = Flowtube_Serial_no[i];
         }
         STRING[++string_counter] = '#';
 
@@ -3751,10 +4854,19 @@ void Send_Configuration(void)
         for(count = 0;count < string_size; count++)
         {
             MySerial.write(STRING[count]);
-            delay(1); 
+            Serial.write(STRING[count]);
+            delay(5); 
         }
         
 }
+
+/************************************************************************************
+**  Function Prototype: void Send_Calibration(void)
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To send calibration data over RS485 in response to command
+*************************************************************************************/
 void Send_Calibration(void)
 {
       char buffer[250];
@@ -3902,6 +5014,13 @@ void Send_Calibration(void)
       //while(1);
 }
 
+/************************************************************************************
+**  Function Prototype: void Led_Operation(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To control led indication based on device operation status
+*************************************************************************************/
 void Led_Operation(void)
 {
         unsigned char Led_State;
@@ -3971,3 +5090,350 @@ void Led_Operation(void)
               digitalWrite(RED_LED,LOW);
         }
 }
+
+/**************************************************************************
+**  Function Prototype: void writeStringToEEPROM(int startAddr, const String& data)  
+**  Passed Parameter  : Starting adrees of memory
+                        data array
+**  Returned Parameter: None
+**  Date of Creation  : 30/04/2025
+**  Discription       : To write characters to memory from string
+***************************************************************************/
+void writeStringToEEPROM(int startAddr, const String& data) 
+{
+  int len = data.length();
+  for (int i = 0; i < len; i++) 
+  {
+    EEPROM.write(startAddr + i, data[i]);
+  }
+  EEPROM.write(startAddr + len, '\0'); // null-terminate
+}
+
+/**************************************************************************
+**  Function Prototype: String readStringFromEEPROM(int startAddr) 
+**  Passed Parameter  : Starting adrees of memory
+**  Returned Parameter: read sring from memory
+**  Date of Creation  : 30/04/2025
+**  Discription       : To read characters from memory and form string
+***************************************************************************/
+String readStringFromEEPROM(int startAddr) 
+{
+  String value;
+  char ch;
+  while ((ch = EEPROM.read(startAddr++)) != '\0') 
+  {
+    value += ch;
+  }
+  return value;
+}
+
+/******************************************************************************************************************************
+**  Function Prototype: void Web_server(void) 
+**  Passed Parameter  : None
+**  Returned Parameter: none
+**  Date of Creation  : 30/04/2025
+**  Discription       : To put device in Access point mode to receive wifi ssid and password
+*********************************************************************************************************************************/
+void Web_server(void)
+{
+
+   WiFi.disconnect(true);
+  
+    // Start Wi-Fi in AP mode
+  WiFi.softAP(ssid1, password1);
+
+  // Print the AP IP address
+  Serial.print("Access Point Started. Connect to Wi-Fi with SSID: ");
+  Serial.println(ssid1);
+  Serial.print("AP IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Configure web server routes
+  server.on("/", handleRoot);        // Serve the configuration form
+  server.on("/submit", handleSubmit); // Handle form submissions
+
+  // Start the web server
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+//-------------------------bootloader functions-----------------------------------
+
+/******************************************************************************************************************************
+**  Function Prototype: bool getDeviceDetails(const String &chipId, String &api_key, String &api_secret) 
+**  Passed Parameter  : chipId     - The unique chip ID of the device.
+//                      api_key    - address of API key.
+//                      api_secret - address of API secret.
+**  Returned Parameter: true if notification is successfully sent, false otherwise
+**  Date of Creation  : 30/04/2025
+**  Discription       : Retrieve the api key and secret key from sever
+*********************************************************************************************************************************/
+bool getDeviceDetails(const String &chipId, String &api_key, String &api_secret) 
+{
+  HTTPClient http;
+  const char* url = "https://iotweet.io/api/method/beetwin_iot.beetwin_iot.api.device_details.get_device_details";
+  
+  // Initialize HTTP connection
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  // Build JSON body for the POST request, including chip ID and DACK flag.
+  String requestBody = "{\"ts\":1734348733000,\"values\":{\"IM\":\"" + chipId + "\",\"DACK\":0}}";
+  //String requestBody = "{\"ts\":1734348733000,\"values\":{\"IM\":\"1224-045-00001\", \"DACK\":0}}";
+
+
+  Serial.println("[BOOT] Requesting device details...");
+  Serial.println("Request Body: " + requestBody);
+
+  // Send POST request to the API.
+  int httpCode = http.POST(requestBody);
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[ERROR] Device details request failed, HTTP code: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+
+  // Retrieve and log the response payload.
+  String payload = http.getString();
+  Serial.println("Device Details Response: " + payload);
+  http.end();
+
+  // Parse the JSON response.
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.print("[ERROR] JSON parse failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  // Extract the 'message' object from the JSON.
+  JsonObject message = doc["message"];
+  if (message.isNull()) {
+    Serial.println("[ERROR] 'message' field not found in device details response.");
+    return false;
+  }
+
+  // Retrieve API credentials from the JSON response.
+  api_key   = message["api_key"].as<String>();
+  api_secret = message["api_secret"].as<String>();
+
+  // Validate that both API credentials are not empty.
+  if (api_key == "" || api_secret == "") {
+    Serial.println("[ERROR] API credentials missing in device details response.");
+    return false;
+  }
+
+  Serial.println("[BOOT] Received API credentials.");
+  return true;
+}
+
+
+/******************************************************************************************************************************
+**  Function Prototype: bool getFirmwareUrl(const String &chipId, const String &api_key, const String &api_secret, String &firmware_url) 
+**  Passed Parameter  : chipId     - The unique chip ID of the device.
+//                      api_key    - API key for HTTP Basic Authentication.
+//                      api_secret - API secret for HTTP Basic Authentication.
+                        firmware_url - (Output) Firmware URL retrieved from the API response
+**  Returned Parameter: true if notification is successfully sent, false otherwise
+**  Date of Creation  : 30/04/2025
+**  Discription       : Retrieve the OTA firmware URL from the configuration API using HTTP Basic Authentication.
+*********************************************************************************************************************************/
+
+bool getFirmwareUrl(const String &chipId, const String &api_key, const String &api_secret, String &firmware_url) 
+{
+  HTTPClient http;
+  const char* url = "https://iotweet.io/api/method/beetwin_iot.beetwin_iot.api.device_config.process_new_config_handle_request";
+  
+  // Begin HTTP connection and set necessary headers.
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  // Set HTTP Basic Authentication credentials.
+  http.setAuthorization(api_key.c_str(), api_secret.c_str());
+
+  // Construct device key by concatenating "LSPL_" with the chip ID.
+  String device_key = "LSPL_" + chipId;
+  // Build JSON body with flags indicating the start of OTA update.
+  String requestBody = "{\"device_key\":\"" + device_key + "\",\"is_ota\":1,\"OACK\":0}";
+  Serial.println("[BOOT] Requesting firmware URL...");
+  Serial.println("Request Body: " + requestBody);
+
+  // Send POST request to obtain the firmware URL.
+  int httpCode = http.POST(requestBody);
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[ERROR] Firmware URL request failed, HTTP code: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+
+  // Retrieve and log the firmware URL response.
+  String payload = http.getString();
+  Serial.println("Firmware URL Response: " + payload);
+  http.end();
+
+  // Parse JSON response.
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.print("[ERROR] JSON parse failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  // Extract the 'message' object.
+  JsonObject message = doc["message"];
+  if (message.isNull()) {
+    Serial.println("[ERROR] 'message' field not found in firmware URL response.");
+    return false;
+  }
+
+  // Extract the firmware URL from the "ota_file_url" field.
+  firmware_url = message["ota_file_url"].as<String>();
+  if (firmware_url == "") {
+    Serial.println("[ERROR] Firmware URL is empty in the response.");
+    return false;
+  }
+
+  Serial.println("[BOOT] Firmware URL obtained.");
+  return true;
+}
+
+
+/******************************************************************************************************************************
+**  Function Prototype: bool notifyFirmwareUpdateStatus(const String &chipId, const String &api_key, const String &api_secret) 
+**  Passed Parameter  : chipId     - The unique chip ID of the device.
+//                      api_key    - API key for HTTP Basic Authentication.
+//                      api_secret - API secret for HTTP Basic Authentication.
+**  Returned Parameter: true if notification is successfully sent, false otherwise
+**  Date of Creation  : 30/04/2025
+**  Discription       : Notify the server that the firmware update process has been completed.
+*********************************************************************************************************************************/
+bool notifyFirmwareUpdateStatus(const String &chipId, const String &api_key, const String &api_secret) 
+{
+  HTTPClient http;
+  const char* url = "https://iotweet.io/api/method/beetwin_iot.beetwin_iot.api.device_config.process_new_config_handle_request";
+  
+  // Begin HTTP connection and set headers.
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  // Use HTTP Basic Authentication.
+  http.setAuthorization(api_key.c_str(), api_secret.c_str());
+
+  // Construct device key.
+  String device_key = "LSPL_" + chipId;
+  // Build JSON body with flags indicating OTA update completion.
+  String requestBody = "{\"device_key\":\"" + device_key + "\",\"is_ota\":0,\"OACK\":1}";
+  Serial.println("[BOOT] Notifying firmware update status...");
+  Serial.println("Request Body: " + requestBody);
+
+  // Send POST request to notify the server.
+  int httpCode = http.POST(requestBody);
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[ERROR] Firmware update status notification failed, HTTP code: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+  
+  // Retrieve and log the server's response.
+  String payload = http.getString();
+  Serial.println("Firmware Update Status Response: " + payload);
+  http.end();
+  return true;
+}
+
+/************************************************************************************************************************************************
+**  Function Prototype: void performOTAUpdate(const String &firmware_url, const String &chipId, const String &api_key, const String &api_secret) 
+**  Passed Parameter  : Firmware download url, Chip id(device pcb no), api key, secret kay
+**  Returned Parameter: Batch num or Cycle Entry status.
+**  Date of Creation  : 30/04/2025
+**  Discription       : This Function connects to server with apikey and secret kay and download the firmware from given url
+*************************************************************************************************************************************************/
+
+void performOTAUpdate(const String &firmware_url, const String &chipId, const String &api_key, const String &api_secret) 
+{
+  if (WiFi.status() != WL_CONNECTED) 
+  {
+    Serial.println("[ERROR] No Wi-Fi connection!");
+    return;
+  }
+
+  Serial.println("[BOOT] Downloading firmware...");
+
+  HTTPClient http;
+  http.begin(firmware_url);
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[ERROR] HTTP Request Failed! Error code: %d\n", httpCode);
+    http.end();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  if (contentLength <= 0) {
+    Serial.println("[ERROR] Invalid firmware file size!");
+    http.end();
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+
+  Serial.printf("[BOOT] Firmware size: %d bytes\n", contentLength);
+
+  // Check if enough space is available
+  if (!Update.begin(contentLength)) {
+    Serial.println("[ERROR] Not enough space for OTA update!");
+    http.end();
+    return;
+  }
+
+  size_t written = 0;
+  uint8_t buff[128] = { 0 };  // small buffer for better control
+  unsigned long lastProgressTime = millis();
+
+  while (http.connected() && (written < contentLength)) {
+    size_t available = stream->available();
+    if (available) {
+      int bytesRead = stream->readBytes(buff, ((available > sizeof(buff)) ? sizeof(buff) : available));
+      if (Update.write(buff, bytesRead) != bytesRead) {
+        Serial.println("[ERROR] Write failed during OTA!");
+        Update.abort();
+        http.end();
+        return;
+      }
+      written += bytesRead;
+
+      // Optional: Progress output
+      if (millis() - lastProgressTime > 1000) {
+        Serial.printf("[BOOT] OTA Progress: %d/%d bytes\n", written, contentLength);
+        lastProgressTime = millis();
+      }
+    }
+    delay(1);  // yield to WiFi stack
+  }
+
+  if (written == contentLength) {
+    Serial.println("[BOOT] Firmware written successfully!");
+    if (Update.end(true)) {
+      Serial.println("[BOOT] OTA Update successful.");
+      
+      if (notifyFirmwareUpdateStatus(chipId, api_key, api_secret)) {
+        Serial.println("[BOOT] Firmware update status notified successfully.");
+      } else {
+        Serial.println("[ERROR] Firmware update status notification failed.");
+      }
+      
+      Serial.println("[BOOT] Restarting...");
+      ESP.restart();
+    } else {
+      Serial.printf("[ERROR] OTA end failed: %s\n", Update.errorString());
+    }
+  } else {
+    Serial.printf("[ERROR] OTA Incomplete: Written %d bytes, Expected %d bytes\n", written, contentLength);
+    Update.abort();
+  }
+
+  http.end();
+}
+
+
